@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sub-Audible: 4-FSK High-Speed Messenger</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #38bdf8;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: #334155;
+      --success: #22c55e;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 20px; display: flex; justify-content: center; }
+    .container { width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 16px; }
+
+    header { text-align: center; }
+    header h1 { font-size: 1.4rem; color: var(--accent); }
+    header p { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+    .indicator.active { background: var(--success); box-shadow: 0 0 8px var(--success); }
+    .indicator.tx { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+    input, button {
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      padding: 12px;
+      font-size: 0.95rem;
+      color: var(--text);
+    }
+    input { background: #0b1120; width: 100%; outline: none; }
+    input:focus { border-color: var(--accent); }
+
+    button {
+      background: var(--accent);
+      color: #0b1120;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.alt { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    button.alt.active { border-color: var(--success); color: var(--success); }
+
+    #logBox {
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      height: 180px;
+      overflow-y: auto;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 0.85rem;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .msg-rx { color: var(--success); }
+    .msg-tx { color: var(--accent); }
+    .msg-sys { color: var(--text-muted); font-size: 0.75rem; }
+
+    canvas { width: 100%; height: 50px; background: #0b1120; border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>Sub-Audible: 4-FSK Modem</h1>
+    <p>2 bits per symbol @ 30ms (~66 bps) | Adaptive noise gate</p>
+  </header>
+
+  <!-- TRANSMITTER -->
+  <div class="card">
+    <div class="badge">
+      <div id="txIndicator" class="indicator"></div>
+      Transmitter
+    </div>
+    <input type="text" id="txInput" placeholder="Message..." maxlength="48" value="FAST TEST">
+    <button id="txBtn">Transmit Message (4-FSK)</button>
+  </div>
+
+  <!-- RECEIVER -->
+  <div class="card">
+    <div class="badge">
+      <div id="rxIndicator" class="indicator"></div>
+      Receiver
+    </div>
+    <canvas id="specCanvas"></canvas>
+    <button id="rxBtn" class="alt">Enable 4-FSK Receiver</button>
+    <div id="logBox">
+      <div class="msg-sys">[System] Ready. Tap to listen.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // --- 4-FSK PROTOCOL CONFIGURATION ---
+  const SAMPLE_RATE   = 48000;
+  const SYMBOL_TIME   = 0.030; // 30ms symbol duration (~66.6 bps)
+  const F_PREAMBLE    = 18000; // Synchronizer pulse
+
+  // 4 discrete frequency channels (separated by 500 Hz to prevent bin leakage)
+  const FREQS = {
+    0b00: 18600, // Symbol 0
+    0b01: 19100, // Symbol 1
+    0b10: 19600, // Symbol 2
+    0b11: 20100  // Symbol 3
+  };
+
+  const END_MARKER = 0x00; // Null-byte message terminator
+
+  let audioCtx = null;
+  let isListening = false;
+
+  function getAudioContext() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    }
+    return audioCtx;
+  }
+
+  const logBox = document.getElementById('logBox');
+  function addLog(text, type = 'rx') {
+    const el = document.createElement('div');
+    el.className = type === 'rx' ? 'msg-rx' : type === 'tx' ? 'msg-tx' : 'msg-sys';
+    el.innerText = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${text}`;
+    logBox.appendChild(el);
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  // --- 1. TRANSMITTER ENGINE ---
+  const txBtn = document.getElementById('txBtn');
+  const txInput = document.getElementById('txInput');
+  const txIndicator = document.getElementById('txIndicator');
+
+  txBtn.onclick = async () => {
+    const text = txInput.value.trim();
+    if (!text) return;
+
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') await ctx.resume();
+
+    txBtn.disabled = true;
+    txIndicator.classList.add('tx');
+    addLog(`Sending: "${text}"`, 'tx');
+
+    const bytes = [...new TextEncoder().encode(text), END_MARKER];
+
+    // 4-FSK Encoding: Map each byte into 4 symbols of 2 bits each
+    const freqQueue = [F_PREAMBLE, F_PREAMBLE, F_PREAMBLE]; // 3 preamble bursts
+    for (const b of bytes) {
+      freqQueue.push(FREQS[(b >> 6) & 0b11]);
+      freqQueue.push(FREQS[(b >> 4) & 0b11]);
+      freqQueue.push(FREQS[(b >> 2) & 0b11]);
+      freqQueue.push(FREQS[b & 0b11]);
+    }
+
+    let t = ctx.currentTime + 0.05;
+    for (const freq of freqQueue) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+
+      // Fast raised-cosine taper to eliminate keying clicks
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.4, t + 0.003);
+      gain.gain.linearRampToValueAtTime(0.4, t + SYMBOL_TIME - 0.003);
+      gain.gain.linearRampToValueAtTime(0, t + SYMBOL_TIME);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + SYMBOL_TIME);
+      t += SYMBOL_TIME;
+    }
+
+    const totalDurationMs = freqQueue.length * SYMBOL_TIME * 1000;
+    setTimeout(() => {
+      txBtn.disabled = false;
+      txIndicator.classList.remove('tx');
+    }, totalDurationMs + 80);
+  };
+
+  // --- 2. RECEIVER ENGINE ---
+  const rxBtn = document.getElementById('rxBtn');
+  const rxIndicator = document.getElementById('rxIndicator');
+  const canvas = document.getElementById('specCanvas');
+  const canvasCtx = canvas.getContext('2d');
+
+  rxBtn.onclick = async () => {
+    if (isListening) return;
+
+    try {
+      const ctx = getAudioContext();
+      if (ctx.state === 'suspended') await ctx.resume();
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048; // Bin size = 48000 / 2048 = 23.43 Hz per bin
+      source.connect(analyser);
+
+      isListening = true;
+      rxBtn.innerText = "Listening (4-FSK Active)";
+      rxBtn.classList.add('active');
+      rxIndicator.classList.add('active');
+      addLog("Receiver online. Listening for 4-FSK symbols...", "sys");
+
+      const binRes = ctx.sampleRate / analyser.fftSize;
+      const binPreamble = Math.round(F_PREAMBLE / binRes);
+      const bins = [
+        Math.round(FREQS[0b00] / binRes),
+        Math.round(FREQS[0b01] / binRes),
+        Math.round(FREQS[0b10] / binRes),
+        Math.round(FREQS[0b11] / binRes)
+      ];
+      // Quiet band between 18.2 kHz and 18.4 kHz to track background noise
+      const binNoise = Math.round(18300 / binRes);
+
+      const buffer = new Uint8Array(analyser.frequencyBinCount);
+
+      let synced = false;
+      let symbolBuffer = [];
+      let decodedBytes = [];
+      let lastSyncTime = 0;
+
+      setInterval(() => {
+        analyser.getByteFrequencyData(buffer);
+
+        const powerPreamble = buffer[binPreamble];
+        const powers = bins.map(b => buffer[b]);
+        const ambientNoise = buffer[binNoise] || 1;
+
+        // Dynamic threshold: Signal must be clear of local noise floor
+        const dynamicThreshold = Math.max(70, ambientNoise * 1.6);
+        const now = Date.now();
+
+        if (!synced) {
+          // Detect preamble spike
+          const maxDataPower = Math.max(...powers);
+          if (powerPreamble > 120 && powerPreamble > maxDataPower * 1.2) {
+            synced = true;
+            symbolBuffer = [];
+            decodedBytes = [];
+            lastSyncTime = now;
+          }
+        } else {
+          // Settle time for preamble pulse clearance
+          if (now - lastSyncTime < (SYMBOL_TIME * 1000 * 2.5)) return;
+
+          // Find strongest tone among 4 candidate channels
+          let bestIdx = -1;
+          let maxVal = dynamicThreshold;
+
+          for (let i = 0; i < 4; i++) {
+            if (powers[i] > maxVal) {
+              maxVal = powers[i];
+              bestIdx = i;
+            }
+          }
+
+          if (bestIdx !== -1) {
+            symbolBuffer.push(bestIdx); // 2 bits decoded
+          }
+
+          // 4 symbols = 8 bits = 1 byte
+          if (symbolBuffer.length === 4) {
+            const byteVal = (symbolBuffer[0] << 6) | 
+                            (symbolBuffer[1] << 4) | 
+                            (symbolBuffer[2] << 2) | 
+                             symbolBuffer[3];
+            symbolBuffer = [];
+
+            if (byteVal === END_MARKER || decodedBytes.length >= 64) {
+              const text = new TextDecoder().decode(new Uint8Array(decodedBytes));
+              addLog(`Received: "${text}"`, 'rx');
+              synced = false;
+              decodedBytes = [];
+            } else {
+              decodedBytes.push(byteVal);
+            }
+          }
+        }
+
+        drawSpectrum(buffer, binPreamble, bins);
+      }, SYMBOL_TIME * 1000);
+
+    } catch (err) {
+      addLog(`Mic Error: ${err.message}`, 'sys');
+    }
+  };
+
+  function drawSpectrum(buffer, pBin, dataBins) {
+    canvasCtx.fillStyle = '#0b1120';
+    canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const startBin = pBin - 15;
+    const endBin = dataBins[3] + 15;
+    const totalBins = endBin - startBin;
+    const barWidth = canvas.width / totalBins;
+
+    for (let i = startBin; i < endBin; i++) {
+      const val = buffer[i] || 0;
+      const h = (val / 255) * canvas.height;
+
+      if (i === pBin) {
+        canvasCtx.fillStyle = '#38bdf8'; // Preamble (Cyan)
+      } else if (dataBins.includes(i)) {
+        canvasCtx.fillStyle = '#22c55e'; // 4-FSK Data Channels (Green)
+      } else {
+        canvasCtx.fillStyle = '#334155'; // Background Noise (Slate)
+      }
+
+      canvasCtx.fillRect((i - startBin) * barWidth, canvas.height - h, barWidth - 1, h);
+    }
+  }
+</script>
+</body>
+</html>
